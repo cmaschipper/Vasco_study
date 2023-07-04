@@ -1,0 +1,400 @@
+---
+title: "Models for analysis of fatigue score in LongCOVID/VASCO studies"
+format: 
+  html:
+    self-contained: true
+editor: visual
+---
+
+Things to address
+
+1.  How to fit smooth splines to the data (without fixing the location knots)?
+
+2.  How to adjust for repeated measurements within persons?
+
+3.  How to test for difference in fatigue scores between groups (COVID variant or sex) for different time points after infection?
+
+4.  How to adjust the models for seasonal effects?
+
+## 0. Preparations
+
+#### Initialize
+
+```{r}
+#| message: false
+# load packages
+library(tidyverse)
+# gamm4 also attaches mgcv and lme4
+library(gamm4)
+```
+
+#### Load data
+
+```{r}
+# import data
+VASCO_data_org <- readRDS(
+  file = file.path(here::here(), "data/20230609_data_VASCO_CIS.rds")
+)
+```
+
+#### Transform data
+
+```{r}
+# transform data
+VASCO_data <- VASCO_data_org |> 
+  # column names in lower case
+  rename_with(
+    .fn = tolower
+  ) |> 
+  mutate(
+    # person_id as factor
+    person_id = studyid |> 
+      factor(),
+    studyid = NULL,
+    # fatigue_score
+    fatigue_score = cis_subj_fat,
+    cis_subj_fat = NULL,
+    # COVID variant as factor
+    variant = variant |> 
+      word(start = 1) |> 
+      factor()
+  )
+
+# restrict to COVID variants Delta & Omicron
+VASCO_data_omicron_delta <- VASCO_data |> 
+  filter(variant %in% c("Delta", "Omicron")) |> 
+  droplevels()
+
+# give summary
+VASCO_data_omicron_delta |> summary()
+```
+
+## 1. How to fit smooth splines to the data (without fixing the location knots)?
+
+The `gam`function from the `mgcv`package is used to fit smooth splines using the `s` function. See `help(gam)` and `help(s)`. The argument `bs` is used specify the type of spline used. The option `bs = "ps"` makes sure a penalized spline is fitted to the data. Where the smoothness in terms of optimal (effective) degrees of freedom is estimated along with the model fit.
+
+```{r}
+# fixed effects only, P-spline for time
+mod_gam_penalized <- gam(
+  formula = fatigue_score ~ 1 + s(time, bs = "ps"),
+  data = VASCO_data_omicron_delta)
+
+# summary of model fit
+mod_gam_penalized |> summary()
+
+# show the fitted spline
+mod_gam_penalized |> plot()
+```
+
+The summary shows that the estimated degrees of freedom for the P-spline is `r mod_gam_penalized |> summary() |> pluck("edf") |> round(2)`, and this spline is significantly different from 0. The shape of the fitted spline, the confidence limits (and the degrees of freedom) are reflected in the figure.
+
+Note that the smoothness is globally over the `time` domain.
+
+To fit a model with a spline that adapts locally to the data one can use `bs = "ad"` to specify the fit of an adaptive spline.
+
+```{r}
+# fixed effects only, adaptive-spline for time
+mod_gam_adaptive <- gam(
+  formula = fatigue_score ~ 1 + s(time, bs = "ad"),
+  data = VASCO_data_omicron_delta)
+
+# summary of model fit
+mod_gam_adaptive |> summary()
+
+# show the fitted spline
+mod_gam_adaptive |> plot()
+```
+
+The estimated degrees of freedom is much higher ( `r mod_gam_adaptive |> summary() |> pluck("edf") |> round(2)`) than in the model with the penalized spline. But also the fit is much better. The AIC is used to judge which of the models fits best to the data:
+
+```{r}
+AIC(mod_gam_penalized, mod_gam_adaptive)
+```
+
+Clearly the model with the adaptive spline should be preferred.
+
+## 2. How to adjust for repeated measurements within persons?
+
+There are multiple measurements for each individual (`person_id`). One can adjust for the repeated measurements by using mixed models. In `mgcv` one can specify random effects as well, by using the `bs = "re"` option within the `s` function. There are however two drawbacks to this implementation:
+
+1.  The combination of an adaptive spline and random effects together in one model is *not* implemented in the `mgcv` framework.
+
+2.  The combination of a penalized spline and random effects *is* feasible, but fails to converge in the `gam` implementation. The `gamm4` package uses the mixed model implementation of the `lme4` package and by using the `gamm4` function from this package the model with penalized spline and random effects can be fit.
+
+```{r}
+# Doesn't work/converge.....
+# mod_gam_penalized_re <- gam(
+#   formula = fatigue_score ~ 1 + s(time, bs = "ps") + s(person_id, bs = "re"),
+#   data = VASCO_data_omicron_delta)
+
+mod_gamm4_penalized <- gamm4(
+  formula = fatigue_score ~ 1 + s(time, bs = "ps"),
+  random = ~(1|person_id),
+  REML = FALSE,
+  data = VASCO_data_omicron_delta)
+
+# summary of model fit
+summary(mod_gamm4_penalized$gam) ## summary of gam
+summary(mod_gamm4_penalized$mer) ## underlying mixed model
+
+# show the fitted spline
+mod_gamm4_penalized$gam |> plot()
+
+```
+
+## 3. How to test for difference in fatigue scores between groups (COVID variant or sex) for different time points after infection?
+
+#### Model fit
+
+In order to test for difference in the predicted outcome between groups, first a model has to be fit that incorporates the interaction between `time`and the group. For example if the interest is in the difference between the two COVID variants over time:
+
+```{r}
+mod_variant_gamm4 <- gamm4(
+  formula = fatigue_score ~ variant + s(time, bs = "ps", by = variant),
+  random = ~(1|person_id),
+  REML = FALSE,
+  data = VASCO_data_omicron_delta)
+```
+
+A side remark here. As model `mod_gamm4_penalized` is nested within model `mod_variant_gamm4`, it is possible to test whether adding the interaction is significant. For this we need the deviance and degrees of freedom of both models and test this via a likelihood-ratio test (LRT):
+
+```{r}
+# extract deviance and df from larger model
+deviance_variant_gamm4 <- mod_variant_gamm4$gam$gcv.ubre
+df_variant_gamm4 <- mod_variant_gamm4$gam |> 
+  logLik() |> 
+  attributes() |> 
+  pluck("df")
+
+# extract deviance and ef from smaller model
+deviance_gamm4_penalized <- mod_gamm4_penalized$gam$gcv.ubre
+df_gamm4_penalized <- mod_gamm4_penalized$gam |> 
+  logLik() |> 
+  attributes() |> 
+  pluck("df")
+
+# LRT
+pchisq(
+  q = -(deviance_variant_gamm4 - deviance_gamm4_penalized), 
+  df = df_variant_gamm4 - df_gamm4_penalized,
+  lower.tail = FALSE)
+```
+
+#### Predictions
+
+##### prediction data
+
+First make a new data set for which predictions are needed
+
+```{r}
+# next create new data set
+VASCO_newdata <- expand_grid(
+  time = -90:300
+)
+```
+
+##### prediction of linear predictor matrix
+
+Based on the fitted model `mod_variant_gamm4` the linear predictor matrix (= `lpmatrix`) of `VASCO_newdata` is obtained.
+
+```{r}
+# linear predictor matrix for variant = Delta
+X_lp_delta <- predict(
+  object  = mod_variant_gamm4$gam,
+  newdata = VASCO_newdata |> 
+    mutate(variant = "Delta"),
+  type = "lpmatrix")
+
+# linear predictor matrix for variant = Omicron
+X_lp_omicron <- predict(
+  object  = mod_variant_gamm4$gam,
+  newdata = VASCO_newdata |> 
+    mutate(variant = "Omicron"),
+  type = "lpmatrix")
+
+# linear predictor matrix of difference
+X_lp_difference <- X_lp_delta - X_lp_omicron
+
+```
+
+##### create predicted outcomes
+
+When the predicted lpmatrix is multiplied by the coefficients of the fitted model this gives the predicted outcomes themselves (see also `help(predict.gam)` and the examples therein. Likewise standard errors and confidence limits can be created.
+
+```{r}
+# coefficients of model fit
+betas <- coef(mod_variant_gamm4$gam)
+# variance covariance matrix
+varcov <- mod_variant_gamm4$gam$Vp
+
+# create predictions of difference over time
+VASCO_newdata <- VASCO_newdata |> 
+  mutate(
+    # calculate prediction of difference
+    pred_difference = X_lp_difference %*% betas,
+    # calculate standard errors of prediction of difference
+    se_pred_difference =  (X_lp_difference %*% varcov %*% t(X_lp_difference)) |> 
+      diag() |> 
+      sqrt(),
+    # calculate confidence limits of prediction of difference
+    ci_lwr_pred_difference = pred_difference - 1.96 * se_pred_difference,
+    ci_upr_pred_difference = pred_difference + 1.96 * se_pred_difference)
+
+```
+
+##### visualize predicted outcomes
+
+```{r}
+# visualize predicted differences   
+ggplot(
+  data = VASCO_newdata,
+  mapping = aes(x = time, y = pred_difference)
+) + 
+  # add predictions
+  geom_line() +
+  # add confidence bands
+  geom_ribbon(
+    mapping = aes(
+      ymin = ci_lwr_pred_difference,
+      ymax = ci_upr_pred_difference),
+    alpha = .3) +
+  # add reference line at 0
+  geom_hline(yintercept = 0, linetype = 2) +
+  # add annotations
+  labs(
+    title ="predicted differences between Delta and Omicron variants",
+    subtitle = "with 95% confidence limits",
+    y = "fatigue_score difference"
+  )
+```
+
+The same can be done for difference between sexes:
+
+```{r}
+# model fit with interaction between time and sex
+mod_sex_gamm4 <- gamm4(
+  formula = fatigue_score ~ geslacht + s(time, bs = "ps", by = geslacht),
+  random = ~(1|person_id),
+  REML = FALSE,
+  data = VASCO_data_omicron_delta)
+
+# create new data set
+VASCO_sex_newdata <- expand_grid(
+  time = -90:300
+)
+
+# linear predictor matrix for sex = Man
+X_lp_man <- predict(
+  object  = mod_sex_gamm4$gam,
+  newdata = VASCO_sex_newdata |> 
+    mutate(geslacht = "Man"),
+  type = "lpmatrix")
+
+# linear predictor matrix for sex = Vrouw
+X_lp_vrouw <- predict(
+  object  = mod_sex_gamm4$gam,
+  newdata = VASCO_sex_newdata |> 
+    mutate(geslacht = "Vrouw"),
+  type = "lpmatrix")
+
+# linear predictor matrix of difference
+X_lp_difference <- X_lp_man - X_lp_vrouw
+
+# coefficients of model fit
+betas <- coef(mod_sex_gamm4$gam)
+# variance covariance matrix
+varcov <- mod_sex_gamm4$gam$Vp
+
+# create predictions of difference over time
+VASCO_sex_newdata <- VASCO_sex_newdata |> 
+  mutate(
+    # calculate prediction of difference
+    pred_difference = X_lp_difference %*% betas,
+    # calculate standard errors of prediction of difference
+    se_pred_difference =  (X_lp_difference %*% varcov %*% t(X_lp_difference)) |> 
+      diag() |> 
+      sqrt(),
+    # calculate confidence limits of prediction of difference
+    ci_lwr_pred_difference = pred_difference - 1.96 * se_pred_difference,
+    ci_upr_pred_difference = pred_difference + 1.96 * se_pred_difference)
+
+# visualize predicted differences   
+ggplot(
+  data = VASCO_sex_newdata,
+  mapping = aes(x = time, y = pred_difference)
+) + 
+  # add predictions
+  geom_line() +
+  # add confidence bands
+  geom_ribbon(
+    mapping = aes(
+      ymin = ci_lwr_pred_difference,
+      ymax = ci_upr_pred_difference),
+    alpha = .3) +
+  # add reference line at 0
+  geom_hline(
+    yintercept = 0, 
+    linetype = 2) +
+  # add annotations
+  labs(
+    title ="predicted differences between Man and Vrouw sexes",
+    subtitle = "with 95% confidence limits",
+    y = "fatigue_score difference"
+  )
+```
+
+## 4. How to adjust the models for seasonal effects?
+
+To adjust for a seasonal effect a cyclic spline can be added to the model. Several sorts of cyclic splines exist, but here the option of a penalized version is given. In the framework of `mgcv` a penalized cyclic spline can be specified with a smooth `s` with argument `bs = "cp"` see `help(cyclic.p.spline)`. A (cyclic) calender time index is needed to construct a penalized cyclic spline, to this extend the variable `maand_infectie` is constructed , representing the month (1-12) of the date of infection (`infectie_datum`):
+
+```{r}
+# add maand_infectie for construction of penalized cyclic spline
+VASCO_data_omicron_delta <- VASCO_data_omicron_delta |> 
+  mutate(
+    maand_infectie = infectie_datum |> 
+      lubridate::month()
+  )
+
+# add season effect (as cyclic spline)
+# k should be chosen large enough here 10
+mod_variant_season_gamm4 <- gamm4(
+  formula = fatigue_score ~ variant + s(time, bs = "ps", by = variant) + s(maand_infectie, bs = "cp", k = 10),
+  # use knots to specify the cycle: month 0 equals month 12
+  knots = list(
+    maand_infectie = c(0, 12)),
+  random = ~(1|person_id),
+  REML = TRUE,
+  data = VASCO_data_omicron_delta)
+
+# summary of model fit
+summary(mod_variant_season_gamm4$gam) ## summary of gam
+summary(mod_variant_season_gamm4$mer) ## underlying mixed model
+
+# shape of splines
+plot(mod_variant_season_gamm4$gam, select = 1, shade = TRUE)
+plot(mod_variant_season_gamm4$gam, select = 2, shade = TRUE)
+plot(mod_variant_season_gamm4$gam, select = 3, shade = TRUE)
+```
+
+Again it can be tested whether the seasonal effect is significant.
+
+```{r}
+deviance_variant_season_gamm4 <- mod_variant_season_gamm4$gam$gcv.ubre
+df_deviance_variant_season_gamm4 <- mod_variant_season_gamm4$gam |> 
+  logLik() |> 
+  attributes() |> 
+  pluck("df")
+
+deviance_variant_gamm4 <- mod_variant_gamm4$gam$gcv.ubre
+df_deviance_variant_gamm4 <- mod_variant_gamm4$gam |> 
+  logLik() |> 
+  attributes() |> 
+  pluck("df")
+
+pchisq(
+  q = -(deviance_variant_season_gamm4 - deviance_variant_gamm4), 
+  df = df_deviance_variant_season_gamm4 - df_deviance_variant_gamm4,
+  lower.tail = FALSE)
+```
+
+Scripts can be found [here](https://gitl01-int-p.rivm.nl/schippem/mimic_trendspotter/).
